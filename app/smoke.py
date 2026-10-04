@@ -2,9 +2,12 @@
 
 Submits an audit that exercises opaque directories, whiteout deletion,
 file/dir replacement, path rebuild in a later layer and hard links, then
-reads the frozen result back and compares it exactly.  Also probes the
-negative paths (too many layers, dangling hard link, traversal, frozen id
-re-use, unknown id).  Exits 0 only if every check passes.
+reads the frozen result back and compares it exactly.  A second audit
+exercises the full per-path evolution entry point (``GET
+/audits/{id}/history``) across opaque clear, ancestor directory
+replacement and later rebuild.  Also probes the negative paths (too many
+layers, dangling hard link, traversal, frozen id re-use, unknown id,
+illegal/untracked history paths).  Exits 0 only if every check passes.
 
 Run: ``APP_ADDR=http://app:8080 python -m app.smoke``
 """
@@ -68,6 +71,56 @@ EXPECTED_DELETIONS = [
      "byLayer": 2, "via": "payload/scratch"},
     {"path": "payload/scratch/tmp.txt", "layer": 0, "kind": "replaced",
      "byLayer": 2, "via": "payload/scratch"},
+]
+
+
+def build_evolution_layers() -> list[str]:
+    """Audit whose 'ev/seq/sample.txt' path sees every evolution action."""
+    layer0 = layer_b64([
+        d("ev"), d("ev/seq"),
+        f("ev/seq/sample.txt", "v0"),
+        f("ev/cal.txt", "v0"),
+    ])
+    layer1 = layer_b64([
+        opq("ev"),                           # opaque-clear lower children
+        f("ev/new.txt", "fresh"),            # same-layer addition survives
+    ])
+    layer2 = layer_b64([
+        d("ev/seq"),                         # rebuild after opaque
+        f("ev/seq/sample.txt", "v2"),
+    ])
+    layer3 = layer_b64([
+        f("ev/seq", "now-a-file"),           # directory -> file replacement
+    ])
+    layer4 = layer_b64([
+        wh("ev", "seq"),                     # whiteout the replacement file
+        d("ev/seq"),                         # rebuild the directory
+        f("ev/seq/sample.txt", "v4"),        # rebuild the descendant
+    ])
+    return [layer0, layer1, layer2, layer3, layer4]
+
+
+# Complete, ordered evolution of ev/seq/sample.txt: creation, opaque clear,
+# rebuild, ancestor-driven disappearance (dir replaced by file) and a final
+# rebuild -- the story the archive engineers need in one read.
+EXPECTED_SAMPLE_HISTORY = [
+    {"action": "create", "layer": 0, "via": "ev/seq/sample.txt",
+     "beforeType": None, "afterType": "file"},
+    {"action": "opaque", "layer": 1, "via": "ev/.wh..wh..opq",
+     "beforeType": "file", "afterType": None},
+    {"action": "recreate", "layer": 2, "via": "ev/seq/sample.txt",
+     "beforeType": None, "afterType": "file"},
+    {"action": "overwrite", "layer": 3, "via": "ev/seq",
+     "beforeType": "file", "afterType": None},
+    {"action": "recreate", "layer": 4, "via": "ev/seq/sample.txt",
+     "beforeType": None, "afterType": "file"},
+]
+
+EXPECTED_EVOLUTION_PATHS = [
+    {"path": "ev", "type": "dir", "layer": 0},
+    {"path": "ev/new.txt", "type": "file", "layer": 1},
+    {"path": "ev/seq", "type": "dir", "layer": 4},
+    {"path": "ev/seq/sample.txt", "type": "file", "layer": 4},
 ]
 
 
@@ -155,6 +208,69 @@ def main() -> int:
 
     status, _ = _request("GET", addr + "/audits/never-submitted")
     check("GET unknown id -> 404", status == 404, f"got {status}")
+
+    print("[smoke] submitting opaque/replacement/rebuild evolution audit",
+          flush=True)
+    ev_id = f"{audit_id}-evolution"
+    status, ev_created = _request(
+        "POST", addr + "/audits",
+        {"id": ev_id, "layers": build_evolution_layers()})
+    check("POST evolution audit -> 201", status == 201,
+          f"got {status}: {ev_created}")
+    if status == 201:
+        check("evolution frozen paths match",
+              ev_created.get("paths") == EXPECTED_EVOLUTION_PATHS,
+              json.dumps(ev_created.get("paths")))
+
+    status, hist = _request(
+        "GET", f"{addr}/audits/{ev_id}/history?path=ev/seq/sample.txt")
+    check("GET history -> 200", status == 200, f"got {status}: {hist}")
+    if status == 200:
+        check("history status present", hist.get("status") == "present")
+        check("complete evolution (create/opaque/recreate/overwrite/"
+              "recreate)",
+              hist.get("history") == EXPECTED_SAMPLE_HISTORY,
+              json.dumps(hist.get("history")))
+        final = next((p for p in ev_created.get("paths", [])
+                      if p["path"] == "ev/seq/sample.txt"), None)
+        check("history final source matches frozen verdict",
+              final is not None
+              and hist.get("final", {}).get("layer") == final["layer"]
+              and hist.get("final", {}).get("type") == final["type"],
+              f"{hist.get('final')} != {final}")
+
+    # The wiped calibration file explains its own opaque disappearance.
+    status, gone = _request(
+        "GET", f"{addr}/audits/{ev_id}/history?path=ev/cal.txt")
+    check("deleted path history -> status deleted",
+          status == 200 and gone.get("status") == "deleted"
+          and gone.get("final") is None
+          and [e["action"] for e in gone.get("history", [])]
+          == ["create", "opaque"],
+          json.dumps(gone))
+
+    # A legal path that never appeared in any layer is explicitly untracked.
+    status, untracked = _request(
+        "GET", f"{addr}/audits/{ev_id}/history?path=ev/not-here.bin")
+    check("untracked legal path -> 200 status untracked",
+          status == 200 and untracked.get("status") == "untracked"
+          and untracked.get("history") == [],
+          json.dumps(untracked))
+
+    # Illegal paths, missing parameter and unknown audits must not leak any
+    # partial record.
+    for bad in ("..%2Fescape", "%2Fabs", "ev%2F", "ev%2F.%2Fx"):
+        status, body = _request(
+            "GET", f"{addr}/audits/{ev_id}/history?path={bad}")
+        check(f"illegal path {bad} -> 400 with no record",
+              status == 400 and "history" not in body and "final" not in body,
+              f"got {status}: {body}")
+    status, body = _request("GET", f"{addr}/audits/{ev_id}/history")
+    check("missing path parameter -> 400", status == 400, f"got {status}")
+    status, body = _request(
+        "GET", f"{addr}/audits/no-such-audit/history?path=ev/new.txt")
+    check("history for unknown audit -> 404 with no record",
+          status == 404 and "history" not in body, f"got {status}: {body}")
 
     if failures:
         print(f"[smoke] FAILED ({len(failures)} check(s))", flush=True)

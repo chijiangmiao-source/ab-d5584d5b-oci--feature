@@ -9,6 +9,13 @@ Endpoints:
                         yields 400 and stores nothing.  Re-using an existing
                         id yields 409 (audits are immutable once frozen).
 * ``GET  /audits/{id}`` return the frozen result (404 if unknown).
+* ``GET  /audits/{id}/history?path=<p>``
+                        ordered evolution of one canonical path: create,
+                        overwrite, whiteout, opaque and recreate events with
+                        the acting layer, triggering entry and before/after
+                        types.  A legal path that never appeared returns
+                        ``status: "untracked"``; illegal paths get 400 and
+                        unknown ids 404, with no partial record leaked.
 * ``GET  /audits``      list frozen audit ids.
 * ``GET  /healthz``     liveness probe used by the Compose healthcheck.
 
@@ -36,6 +43,24 @@ MAX_LAYERS = 6
 MAX_BODY = 64 * 1024 * 1024
 MAX_LAYER_BYTES = 16 * 1024 * 1024
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def validate_query_path(raw: str) -> str | None:
+    """Canonicalize a ``path`` query value; return None if it is illegal.
+
+    Mirrors the layer path rules: relative, no empty/``.`` components, no
+    ``..`` traversal, no trailing slash.
+    """
+    if not raw or raw != raw.strip():
+        return None
+    if raw.startswith("/"):
+        return None
+    if raw.endswith("/"):
+        return None
+    for part in raw.split("/"):
+        if part in ("", ".", ".."):
+            return None
+    return raw
 
 
 class AuditStore:
@@ -106,19 +131,27 @@ def make_handler(store: AuditStore):
             self._send(code, {"error": message})
 
         def do_GET(self) -> None:  # noqa: N802 (http.server naming)
-            path = urllib.parse.urlsplit(self.path).path
+            parsed = urllib.parse.urlsplit(self.path)
+            path = parsed.path
             if path == "/healthz":
                 self._send(200, {"status": "ok"})
             elif path == "/":
                 self._send(200, {
                     "service": "payload-overlay-audit",
                     "endpoints": ["POST /audits", "GET /audits/{id}",
+                                  "GET /audits/{id}/history?path=<path>",
                                   "GET /audits", "GET /healthz"],
                 })
             elif path == "/audits":
                 self._send(200, {"audits": store.ids()})
             elif path.startswith("/audits/"):
-                audit_id = urllib.parse.unquote(path[len("/audits/"):])
+                rest = path[len("/audits/"):]
+                audit_id, sep, tail = rest.partition("/history")
+                if sep and tail == "":
+                    self._get_history(urllib.parse.unquote(audit_id),
+                                      parsed.query)
+                    return
+                audit_id = urllib.parse.unquote(rest)
                 result = store.get(audit_id)
                 if result is None:
                     self._error(404, "audit not found")
@@ -126,6 +159,34 @@ def make_handler(store: AuditStore):
                     self._send(200, result)
             else:
                 self._error(404, "not found")
+
+        def _get_history(self, audit_id: str, query: str) -> None:
+            # Resolve the audit first so an unknown id never reveals even
+            # whether a path is well-formed/tracked elsewhere.
+            result = store.get(audit_id)
+            if result is None:
+                self._error(404, "audit not found")
+                return
+            params = urllib.parse.parse_qs(query, strict_parsing=False)
+            values = params.get("path", [])
+            if len(values) != 1 or not values[0]:
+                self._error(400, "exactly one 'path' query parameter required")
+                return
+            raw_path = urllib.parse.unquote(values[0])
+            canonical = validate_query_path(raw_path)
+            if canonical is None:
+                self._error(400, "illegal path (relative canonical paths only)")
+                return
+            record = engine.history_for(result, canonical)
+            if record is None:
+                self._send(200, {
+                    "id": audit_id,
+                    "path": canonical,
+                    "status": "untracked",
+                    "history": [],
+                })
+                return
+            self._send(200, {"id": audit_id, **record})
 
         def do_POST(self) -> None:  # noqa: N802
             path = urllib.parse.urlsplit(self.path).path

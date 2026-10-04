@@ -2,7 +2,7 @@
 
 import unittest
 
-from app.engine import EngineError, apply_layers
+from app.engine import EngineError, apply_layers, history_for
 from app.tarparse import TYPE_DIR, TYPE_FILE, TYPE_LINK, Entry
 
 
@@ -16,6 +16,11 @@ def D(path):
 
 def L(path, target):
     return Entry(path, TYPE_LINK, 0, target)
+
+
+def W(path):
+    """Whiteout/opaque marker entry (a regular file by TAR type)."""
+    return Entry(path, TYPE_FILE, 0)
 
 
 def paths_of(result):
@@ -181,6 +186,135 @@ class WhiteoutTests(unittest.TestCase):
         self.assertEqual(paths["a"]["type"], "dir")
         self.assertEqual(paths["a"]["layer"], 0)
         self.assertEqual(paths["a/b"]["layer"], 0)
+
+
+EVENT_KEYS = {"action", "layer", "via", "beforeType", "afterType"}
+
+
+def actions(record):
+    return [(e["action"], e["layer"], e["via"],
+             e["beforeType"], e["afterType"]) for e in record["history"]]
+
+
+class HistoryTests(unittest.TestCase):
+    def test_create_event_for_files_and_implicit_dirs(self):
+        result = apply_layers([[F("a/b.txt")]])
+        record = history_for(result, "a")
+        self.assertEqual(record["status"], "present")
+        self.assertEqual(record["final"], {"type": "dir", "layer": 0})
+        self.assertEqual(actions(record), [
+            ("create", 0, "a/b.txt", None, "dir"),
+        ])
+
+    def test_overwrite_file_records_before_and_after_types(self):
+        result = apply_layers([[F("m.txt")], [F("m.txt")]])
+        record = history_for(result, "m.txt")
+        self.assertEqual(actions(record), [
+            ("create", 0, "m.txt", None, "file"),
+            ("overwrite", 1, "m.txt", "file", "file"),
+        ])
+        self.assertEqual(record["final"]["layer"], 1)
+
+    def test_whiteout_then_recreate_is_continuous(self):
+        result = apply_layers([
+            [F("cfg.txt")],
+            [F(".wh.cfg.txt")],
+            [F("cfg.txt")],
+        ])
+        record = history_for(result, "cfg.txt")
+        self.assertEqual([e[0] for e in actions(record)],
+                         ["create", "whiteout", "recreate"])
+        whiteout = record["history"][1]
+        self.assertEqual(whiteout["beforeType"], "file")
+        self.assertEqual(whiteout["afterType"], None)
+        self.assertEqual(whiteout["via"], ".wh.cfg.txt")
+        self.assertEqual(whiteout["layer"], 1)
+        self.assertEqual(record["status"], "present")
+        self.assertEqual(record["final"]["layer"], 2)
+
+    def test_opaque_clear_then_recreate(self):
+        result = apply_layers([
+            [D("d"), F("d/x.txt")],
+            [F("d/.wh..wh..opq")],
+            [F("d/x.txt")],
+        ])
+        record = history_for(result, "d/x.txt")
+        self.assertEqual([e[0] for e in actions(record)],
+                         ["create", "opaque", "recreate"])
+        self.assertEqual(record["history"][1]["via"], "d/.wh..wh..opq")
+        self.assertEqual(record["final"]["layer"], 2)
+
+    def test_descendant_sees_ancestor_whiteout(self):
+        result = apply_layers([
+            [D("a"), D("a/b"), F("a/b/c.txt")],
+            [F("a/.wh.b")],
+        ])
+        record = history_for(result, "a/b/c.txt")
+        self.assertEqual(record["status"], "deleted")
+        self.assertIsNone(record["final"])
+        self.assertEqual([e[0] for e in actions(record)],
+                         ["create", "whiteout"])
+        event = record["history"][1]
+        self.assertEqual(event["via"], "a/.wh.b")
+        self.assertEqual(event["beforeType"], "file")
+        self.assertIsNone(event["afterType"])
+
+    def test_descendant_sees_ancestor_dir_replacement_then_rebuild(self):
+        result = apply_layers([
+            [D("p"), D("p/c"), F("p/c/child.txt")],
+            [F("p")],
+            [W(".wh.p")],
+            [D("p"), D("p/c"), F("p/c/child.txt")],
+        ])
+        record = history_for(result, "p/c/child.txt")
+        self.assertEqual([e[0] for e in actions(record)],
+                         ["create", "overwrite", "recreate"])
+        replace = record["history"][1]
+        self.assertEqual(replace["via"], "p")
+        self.assertIsNone(replace["afterType"])
+        # Rebuilt history ends at the same source layer as the frozen verdict.
+        final = next(p for p in result["paths"]
+                     if p["path"] == "p/c/child.txt")
+        self.assertEqual(record["final"]["layer"], final["layer"])
+        self.assertEqual(record["final"]["layer"], 3)
+
+    def test_dir_replaced_by_file_then_back_to_dir(self):
+        result = apply_layers([
+            [D("p"), F("p/a.txt")],
+            [F("p")],
+            [F(".wh.p")],
+            [D("p"), F("p/b.txt")],
+        ])
+        record = history_for(result, "p")
+        self.assertEqual([e[0] for e in actions(record)],
+                         ["create", "overwrite", "whiteout", "recreate"])
+        self.assertEqual(
+            [e[4] for e in actions(record)], ["dir", "file", None, "dir"])
+        self.assertEqual(record["final"], {"type": "dir", "layer": 3})
+
+    def test_deleted_but_never_rebuilt_is_deleted(self):
+        result = apply_layers([[F("gone.txt")], [F(".wh.gone.txt")]])
+        record = history_for(result, "gone.txt")
+        self.assertEqual(record["status"], "deleted")
+        self.assertIsNone(record["final"])
+
+    def test_untracked_legal_path_returns_none(self):
+        result = apply_layers([[F("a.txt")]])
+        self.assertIsNone(history_for(result, "never/mentioned.txt"))
+
+    def test_events_carry_only_evolution_fields(self):
+        result = apply_layers([[F("a.txt")], [F(".wh.a.txt")]])
+        record = history_for(result, "a.txt")
+        for event in record["history"]:
+            self.assertEqual(set(event), EVENT_KEYS)
+
+    def test_hardlink_history_keeps_final_link(self):
+        result = apply_layers([
+            [F("a.txt"), L("b.txt", "a.txt")],
+        ])
+        record = history_for(result, "b.txt")
+        self.assertEqual(record["final"],
+                         {"type": "file", "layer": 0, "link": "a.txt"})
 
 
 if __name__ == "__main__":
