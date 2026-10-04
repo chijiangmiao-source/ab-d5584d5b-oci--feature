@@ -17,6 +17,15 @@ Rules implemented:
 * Hard links must resolve to a regular file that appeared earlier in the
   same layer and still exists in the tree (no dangling links).
 * Duplicate canonical paths within one layer are rejected.
+
+Besides the frozen path list and the deletion evidence, the engine records
+a per-path evolution log (``history``): every action that touches a path —
+creation, replacement, whiteout deletion, opaque clearing, re-creation —
+is appended in layer order with the acting layer, the triggering entry and
+the path's type before/after the action.  When a directory is replaced or
+whited-out, each removed descendant gets its own event whose ``via`` names
+the ancestor-level entry that explains the disappearance, so the history of
+any path is self-contained and continuous across re-creation.
 """
 
 from __future__ import annotations
@@ -45,7 +54,24 @@ def _parent(path: str) -> str:
     return path[:idx] if idx != -1 else ""
 
 
-def _ensure_dir(tree: dict[str, Node], path: str, layer: int) -> None:
+def _record(history: dict[str, list[dict]], path: str, action: str,
+            layer: int, via: str, from_type: str | None,
+            to_type: str | None, link: str | None = None) -> None:
+    """Append one evolution event to ``path``'s history log."""
+    event = {
+        "action": action,      # created | replaced | whiteout | opaque
+        "layer": layer,        # layer that performed the action
+        "via": via,            # entry path that triggered the action
+        "fromType": from_type, # type before the action (None = absent)
+        "toType": to_type,     # type after the action (None = removed)
+    }
+    if link is not None:
+        event["link"] = link
+    history.setdefault(path, []).append(event)
+
+
+def _ensure_dir(tree: dict[str, Node], path: str, layer: int, via: str,
+                history: dict[str, list[dict]]) -> None:
     """Materialize ``path`` (and missing ancestors) as directories."""
     if not path:
         return
@@ -55,13 +81,21 @@ def _ensure_dir(tree: dict[str, Node], path: str, layer: int) -> None:
         node = tree.get(prefix)
         if node is None:
             tree[prefix] = Node("dir", layer)
+            _record(history, prefix, "created", layer, via, None, "dir")
         elif node.type != "dir":
             raise EngineError(f"parent {prefix!r} is not a directory")
 
 
 def _drop_subtree(tree: dict[str, Node], root: str, kind: str,
-                  by_layer: int, via: str, deletions: list[dict]) -> None:
-    """Remove ``root`` and its descendants, recording deletion evidence."""
+                  by_layer: int, via: str, deletions: list[dict],
+                  history: dict[str, list[dict]],
+                  root_to_type: str | None = None) -> None:
+    """Remove ``root`` and its descendants, recording deletion evidence.
+
+    Every removed path also gets a history event.  When the action replaces
+    ``root`` with a new entry (``root_to_type`` set), the root's event keeps
+    the type it becomes; descendants always end up absent (``toType`` None).
+    """
     victims = sorted(p for p in tree if p == root or p.startswith(root + "/"))
     for path in victims:
         node = tree.pop(path)
@@ -72,9 +106,12 @@ def _drop_subtree(tree: dict[str, Node], root: str, kind: str,
             "byLayer": by_layer,
             "via": via,
         })
+        _record(history, path, kind, by_layer, via, node.type,
+                root_to_type if path == root else None)
 
 
 def _apply_one(tree: dict[str, Node], deletions: list[dict],
+               history: dict[str, list[dict]],
                index: int, entries: list[Entry]) -> None:
     seen: set[str] = set()
     linkables: set[str] = set()  # file/link entries earlier in this layer
@@ -86,7 +123,7 @@ def _apply_one(tree: dict[str, Node], deletions: list[dict],
         parent = _parent(entry.path)
 
         if base == OPAQUE_MARKER:
-            _ensure_dir(tree, parent, index)
+            _ensure_dir(tree, parent, index, entry.path, history)
             prefix = parent + "/" if parent else ""
             for path in sorted(list(tree)):
                 node = tree[path]
@@ -99,29 +136,39 @@ def _apply_one(tree: dict[str, Node], deletions: list[dict],
                         "byLayer": index,
                         "via": entry.path,
                     })
+                    _record(history, path, "opaque", index, entry.path,
+                            node.type, None)
             continue
 
         if base.startswith(WHITEOUT_PREFIX):
             name = base[len(WHITEOUT_PREFIX):]
             if not name:
                 raise EngineError(f"invalid whiteout entry {entry.path!r}")
-            _ensure_dir(tree, parent, index)
+            _ensure_dir(tree, parent, index, entry.path, history)
             target = parent + "/" + name if parent else name
             # Deleting a path absent from the union is a tolerated no-op.
-            _drop_subtree(tree, target, "whiteout", index, entry.path, deletions)
+            _drop_subtree(tree, target, "whiteout", index, entry.path,
+                          deletions, history)
             continue
 
-        _ensure_dir(tree, parent, index)
+        _ensure_dir(tree, parent, index, entry.path, history)
         ntype = "dir" if entry.type == TYPE_DIR else "file"
         existing = tree.get(entry.path)
+        replaced = False
         if existing is not None and not (existing.type == "dir" and ntype == "dir"):
             # File/dir replacement (either direction) or file superseded:
             # the lower content is removed and recorded as evidence.
-            _drop_subtree(tree, entry.path, "replaced", index, entry.path, deletions)
+            _drop_subtree(tree, entry.path, "replaced", index, entry.path,
+                          deletions, history, root_to_type=ntype)
             existing = None
+            replaced = True
         if existing is None:
             tree[entry.path] = Node(
                 ntype, index, entry.link if entry.type == TYPE_LINK else None)
+            if not replaced:
+                _record(history, entry.path, "created", index, entry.path,
+                        None, ntype,
+                        entry.link if entry.type == TYPE_LINK else None)
 
         if entry.type == TYPE_LINK:
             if entry.link not in linkables:
@@ -137,12 +184,19 @@ def _apply_one(tree: dict[str, Node], deletions: list[dict],
 
 
 def apply_layers(layers: list[list[Entry]]) -> dict:
-    """Apply validated layers bottom-to-top; return the frozen adjudication."""
+    """Apply validated layers bottom-to-top; return the frozen adjudication.
+
+    The returned dict carries the final ``paths`` list, the ``deletions``
+    evidence and the per-path evolution ``history`` (path -> events in
+    layer order).  The history is derived from the same adjudication, so a
+    present path's last event always agrees with its ``paths[]`` entry.
+    """
     tree: dict[str, Node] = {}
     deletions: list[dict] = []
+    history: dict[str, list[dict]] = {}
     for index, entries in enumerate(layers):
         try:
-            _apply_one(tree, deletions, index, entries)
+            _apply_one(tree, deletions, history, index, entries)
         except EngineError as exc:
             raise EngineError(f"layer {index}: {exc}") from exc
     paths = []
@@ -153,4 +207,4 @@ def apply_layers(layers: list[list[Entry]]) -> dict:
             item["link"] = node.link
         paths.append(item)
     deletions.sort(key=lambda d: (d["byLayer"], d["path"]))
-    return {"paths": paths, "deletions": deletions}
+    return {"paths": paths, "deletions": deletions, "history": history}

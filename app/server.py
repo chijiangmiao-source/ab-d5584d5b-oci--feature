@@ -9,6 +9,16 @@ Endpoints:
                         yields 400 and stores nothing.  Re-using an existing
                         id yields 409 (audits are immutable once frozen).
 * ``GET  /audits/{id}`` return the frozen result (404 if unknown).
+* ``GET  /audits/{id}/history?path=<p>``
+                        return the evolution record of one canonical path
+                        of a frozen audit: creation, replacement, whiteout
+                        deletion, opaque clearing and re-creation in layer
+                        order, each with the acting layer, the triggering
+                        entry and the type before/after the action.  A
+                        canonical path that never appeared yields an
+                        explicit ``{"tracked": false}`` result; an illegal
+                        path yields 400 and an unknown or never-frozen
+                        audit 404 — no partial records are ever exposed.
 * ``GET  /audits``      list frozen audit ids.
 * ``GET  /healthz``     liveness probe used by the Compose healthcheck.
 
@@ -39,30 +49,47 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class AuditStore:
-    """In-memory registry of frozen audits (id -> immutable result)."""
+    """In-memory registry of frozen audits (id -> immutable record).
+
+    Each record pairs the public frozen ``result`` with the per-path
+    evolution ``history``; both are stored together at freeze time, so a
+    rejected audit can never leave a partially retrievable record behind.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._audits: dict[str, dict] = {}
 
-    def freeze(self, audit_id: str, result: dict) -> bool:
+    def freeze(self, audit_id: str, result: dict, history: dict) -> bool:
         with self._lock:
             if audit_id in self._audits:
                 return False
-            self._audits[audit_id] = result
+            self._audits[audit_id] = {"result": result, "history": history}
             return True
 
     def get(self, audit_id: str) -> dict | None:
         with self._lock:
-            return self._audits.get(audit_id)
+            record = self._audits.get(audit_id)
+            return record["result"] if record is not None else None
+
+    def history(self, audit_id: str) -> dict | None:
+        with self._lock:
+            record = self._audits.get(audit_id)
+            return record["history"] if record is not None else None
 
     def ids(self) -> list[str]:
         with self._lock:
             return sorted(self._audits)
 
 
-def build_audit(audit_id, layers_b64) -> dict:
-    """Validate the request payload and adjudicate all layers atomically."""
+def build_audit(audit_id, layers_b64) -> tuple[dict, dict]:
+    """Validate the payload and adjudicate all layers atomically.
+
+    Returns ``(frozen_result, history)``: the public frozen result keeps
+    its established shape (``id``, ``layerCount``, ``paths``,
+    ``deletions``), while the per-path evolution history is stored
+    alongside it and served only by the history endpoint.
+    """
     if not isinstance(audit_id, str) or not ID_RE.match(audit_id):
         raise ValueError("invalid audit id "
                          "(1-128 chars: letters, digits, '.', '_', '-')")
@@ -86,7 +113,8 @@ def build_audit(audit_id, layers_b64) -> dict:
         result = engine.apply_layers(layers)
     except engine.EngineError as exc:
         raise ValueError(str(exc)) from exc
-    return {"id": audit_id, "layerCount": len(layers), **result}
+    history = result.pop("history")
+    return {"id": audit_id, "layerCount": len(layers), **result}, history
 
 
 def make_handler(store: AuditStore):
@@ -106,19 +134,29 @@ def make_handler(store: AuditStore):
             self._send(code, {"error": message})
 
         def do_GET(self) -> None:  # noqa: N802 (http.server naming)
-            path = urllib.parse.urlsplit(self.path).path
+            split = urllib.parse.urlsplit(self.path)
+            path = split.path
             if path == "/healthz":
                 self._send(200, {"status": "ok"})
             elif path == "/":
                 self._send(200, {
                     "service": "payload-overlay-audit",
                     "endpoints": ["POST /audits", "GET /audits/{id}",
+                                  "GET /audits/{id}/history?path=<path>",
                                   "GET /audits", "GET /healthz"],
                 })
             elif path == "/audits":
                 self._send(200, {"audits": store.ids()})
             elif path.startswith("/audits/"):
-                audit_id = urllib.parse.unquote(path[len("/audits/"):])
+                rest = urllib.parse.unquote(path[len("/audits/"):])
+                audit_id, sep, sub = rest.partition("/")
+                if sep:
+                    # Audit ids never contain '/', so this is a sub-resource.
+                    if sub == "history":
+                        self._history(audit_id, split.query)
+                    else:
+                        self._error(404, "not found")
+                    return
                 result = store.get(audit_id)
                 if result is None:
                     self._error(404, "audit not found")
@@ -126,6 +164,40 @@ def make_handler(store: AuditStore):
                     self._send(200, result)
             else:
                 self._error(404, "not found")
+
+        def _history(self, audit_id: str, query: str) -> None:
+            result = store.get(audit_id)
+            if result is None:
+                # Unknown or never-frozen audit: no record exists to leak.
+                self._error(404, "audit not found")
+                return
+            raw = urllib.parse.parse_qs(query).get("path", [None])[0]
+            if raw is None:
+                self._error(400, "missing 'path' query parameter")
+                return
+            try:
+                target = tarparse.canonical_path(raw, is_dir=False)
+            except tarparse.TarError as exc:
+                self._error(400, f"invalid path: {exc}")
+                return
+            events = store.history(audit_id).get(target)
+            body = {"id": audit_id, "path": target}
+            if events is None:
+                # Canonical path that never appeared in any layer.
+                body.update({"tracked": False, "present": False,
+                             "type": None, "layer": None, "actions": []})
+            else:
+                # Final state comes from the frozen path list itself, so it
+                # can never disagree with the audit result.
+                final = next((p for p in result["paths"]
+                              if p["path"] == target), None)
+                body.update({"tracked": True, "present": final is not None,
+                             "type": final["type"] if final else None,
+                             "layer": final["layer"] if final else None,
+                             "actions": events})
+                if final is not None and "link" in final:
+                    body["link"] = final["link"]
+            self._send(200, body)
 
         def do_POST(self) -> None:  # noqa: N802
             path = urllib.parse.urlsplit(self.path).path
@@ -152,11 +224,12 @@ def make_handler(store: AuditStore):
                 self._error(400, "JSON object expected")
                 return
             try:
-                result = build_audit(payload.get("id"), payload.get("layers"))
+                result, history = build_audit(payload.get("id"),
+                                              payload.get("layers"))
             except ValueError as exc:
                 self._error(400, str(exc))
                 return
-            if not store.freeze(result["id"], result):
+            if not store.freeze(result["id"], result, history):
                 self._error(409, "audit id already frozen")
                 return
             self._send(201, result)

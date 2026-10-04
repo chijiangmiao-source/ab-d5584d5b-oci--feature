@@ -4,6 +4,7 @@ import json
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -137,6 +138,142 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(req, timeout=5)
         self.assertEqual(ctx.exception.code, 400)
+
+
+class HistoryEndpointTests(unittest.TestCase):
+    """GET /audits/{id}/history?path=... on frozen audits."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(
+            ("127.0.0.1", 0), server.make_handler(server.AuditStore()))
+        cls.httpd.daemon_threads = True
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        # One frozen audit shared by the read-only history tests:
+        #   layer 0: p/ + p/sub/a.txt + p/keep.txt
+        #   layer 1: whiteout of p/sub, p/manifest.txt created
+        #   layer 2: p/sub/a.txt rebuilt, p/manifest.txt superseded
+        layers = [
+            layer_b64([d("p"), d("p/sub"), f("p/sub/a.txt", "1"),
+                       f("p/keep.txt", "k")]),
+            layer_b64([wh("p", "sub"), f("p/manifest.txt", "m1")]),
+            layer_b64([f("p/sub/a.txt", "2"), f("p/manifest.txt", "m2")]),
+        ]
+        status, cls.frozen = request("POST", cls.base + "/audits",
+                                     {"id": "h-main", "layers": layers})
+        assert status == 201, cls.frozen
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def history(self, audit_id, raw_path=None):
+        url = f"{self.base}/audits/{audit_id}/history"
+        if raw_path is not None:
+            url += "?" + urllib.parse.urlencode({"path": raw_path})
+        return request("GET", url)
+
+    def test_frozen_result_has_no_history_key(self):
+        self.assertNotIn("history", self.frozen)
+        status, got = request("GET", self.base + "/audits/h-main")
+        self.assertEqual(status, 200)
+        self.assertEqual(got, self.frozen)
+        self.assertNotIn("history", got)
+
+    def test_rebuilt_path_full_evolution(self):
+        status, body = self.history("h-main", "p/sub/a.txt")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["id"], "h-main")
+        self.assertEqual(body["path"], "p/sub/a.txt")
+        self.assertTrue(body["tracked"])
+        # Final state consistent with the frozen path list.
+        final = next(p for p in self.frozen["paths"]
+                     if p["path"] == "p/sub/a.txt")
+        self.assertTrue(body["present"])
+        self.assertEqual(body["type"], final["type"])
+        self.assertEqual(body["layer"], final["layer"])
+        self.assertEqual(body["actions"], [
+            {"action": "created", "layer": 0, "via": "p/sub/a.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "whiteout", "layer": 1, "via": "p/.wh.sub",
+             "fromType": "file", "toType": None},
+            {"action": "created", "layer": 2, "via": "p/sub/a.txt",
+             "fromType": None, "toType": "file"},
+        ])
+
+    def test_ancestor_dir_history_shows_removal_and_rebuild(self):
+        status, body = self.history("h-main", "p/sub")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["actions"], [
+            {"action": "created", "layer": 0, "via": "p/sub",
+             "fromType": None, "toType": "dir"},
+            {"action": "whiteout", "layer": 1, "via": "p/.wh.sub",
+             "fromType": "dir", "toType": None},
+            {"action": "created", "layer": 2, "via": "p/sub/a.txt",
+             "fromType": None, "toType": "dir"},
+        ])
+        self.assertTrue(body["present"])
+        self.assertEqual(body["layer"], 2)
+
+    def test_superseded_file_history(self):
+        status, body = self.history("h-main", "p/manifest.txt")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["actions"], [
+            {"action": "created", "layer": 1, "via": "p/manifest.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "replaced", "layer": 2, "via": "p/manifest.txt",
+             "fromType": "file", "toType": "file"},
+        ])
+        self.assertTrue(body["present"])
+        self.assertEqual(body["layer"], 2)
+
+    def test_untouched_path_has_single_creation_event(self):
+        status, body = self.history("h-main", "p/keep.txt")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["actions"], [
+            {"action": "created", "layer": 0, "via": "p/keep.txt",
+             "fromType": None, "toType": "file"},
+        ])
+
+    def test_untracked_canonical_path(self):
+        status, body = self.history("h-main", "p/never.txt")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tracked"], False)
+        self.assertEqual(body["present"], False)
+        self.assertEqual(body["actions"], [])
+        # Whiteout entries never entered the tree: also untracked.
+        status, body = self.history("h-main", "p/.wh.sub")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tracked"], False)
+
+    def test_illegal_paths_rejected(self):
+        for raw in ("../escape.txt", "/abs.txt", "p/", "p//a.txt", "p/./a.txt"):
+            status, body = self.history("h-main", raw)
+            self.assertEqual(status, 400, raw)
+            self.assertIn("error", body)
+
+    def test_missing_path_param(self):
+        status, _ = request("GET", self.base + "/audits/h-main/history")
+        self.assertEqual(status, 400)
+
+    def test_unknown_audit(self):
+        status, _ = self.history("no-such-audit", "p")
+        self.assertEqual(status, 404)
+
+    def test_never_frozen_audit_leaks_nothing(self):
+        layers = [layer_b64([ln("x/y", "x/missing")])]
+        status, _ = request("POST", self.base + "/audits",
+                            {"id": "h-failed", "layers": layers})
+        self.assertEqual(status, 400)
+        status, _ = self.history("h-failed", "x/y")
+        self.assertEqual(status, 404)
+
+    def test_unknown_subresource(self):
+        status, _ = request("GET", self.base + "/audits/h-main/bogus")
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

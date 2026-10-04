@@ -1,6 +1,7 @@
 #!/bin/sh
 # Verify container entrypoint: whiteout-rule tests and build checks first,
-# then an HTTP smoke audit (opaque + rebuild paths) against the app service.
+# then an HTTP smoke audit (opaque + rebuild paths) against the app service,
+# including reading one path's full evolution record via the history endpoint.
 # The container exits with the status of the first failing step (or 0).
 set -eu
 cd "$(dirname "$0")/.."

@@ -183,5 +183,133 @@ class WhiteoutTests(unittest.TestCase):
         self.assertEqual(paths["a/b"]["layer"], 0)
 
 
+class HistoryTests(unittest.TestCase):
+    """Per-path evolution records produced alongside the adjudication."""
+
+    def test_create_whiteout_rebuild_is_continuous(self):
+        result = apply_layers([
+            [F("cfg.txt")],
+            [F(".wh.cfg.txt")],
+            [F("cfg.txt")],
+        ])
+        self.assertEqual(result["history"]["cfg.txt"], [
+            {"action": "created", "layer": 0, "via": "cfg.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "whiteout", "layer": 1, "via": ".wh.cfg.txt",
+             "fromType": "file", "toType": None},
+            {"action": "created", "layer": 2, "via": "cfg.txt",
+             "fromType": None, "toType": "file"},
+        ])
+        # Final source layer agrees with the frozen path list.
+        self.assertEqual(paths_of(result)["cfg.txt"]["layer"], 2)
+
+    def test_file_superseded_records_single_replace_event(self):
+        result = apply_layers([[F("m.txt")], [F("m.txt")]])
+        self.assertEqual(result["history"]["m.txt"], [
+            {"action": "created", "layer": 0, "via": "m.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "replaced", "layer": 1, "via": "m.txt",
+             "fromType": "file", "toType": "file"},
+        ])
+
+    def test_dir_replaced_by_file_explains_descendant_disappearance(self):
+        result = apply_layers([[D("p"), F("p/child.txt")], [F("p")]])
+        self.assertEqual(result["history"]["p"], [
+            {"action": "created", "layer": 0, "via": "p",
+             "fromType": None, "toType": "dir"},
+            {"action": "replaced", "layer": 1, "via": "p",
+             "fromType": "dir", "toType": "file"},
+        ])
+        # The descendant's log carries the ancestor action (via = "p").
+        self.assertEqual(result["history"]["p/child.txt"], [
+            {"action": "created", "layer": 0, "via": "p/child.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "replaced", "layer": 1, "via": "p",
+             "fromType": "file", "toType": None},
+        ])
+
+    def test_opaque_clearing_recorded_per_removed_child(self):
+        result = apply_layers([
+            [D("d"), F("d/old.txt")],
+            [F("d/.wh..wh..opq"), F("d/new.txt")],
+        ])
+        self.assertEqual(result["history"]["d/old.txt"], [
+            {"action": "created", "layer": 0, "via": "d/old.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "opaque", "layer": 1, "via": "d/.wh..wh..opq",
+             "fromType": "file", "toType": None},
+        ])
+        self.assertEqual(result["history"]["d/new.txt"], [
+            {"action": "created", "layer": 1, "via": "d/new.txt",
+             "fromType": None, "toType": "file"},
+        ])
+        # The opaque dir itself survives untouched: no extra events.
+        self.assertEqual(result["history"]["d"], [
+            {"action": "created", "layer": 0, "via": "d",
+             "fromType": None, "toType": "dir"},
+        ])
+
+    def test_rebuild_under_whited_out_dir_keeps_history_continuous(self):
+        result = apply_layers([
+            [D("a"), D("a/b"), F("a/b/c.txt")],
+            [F("a/.wh.b")],
+            [F("a/b/c.txt")],
+        ])
+        self.assertEqual(result["history"]["a/b/c.txt"], [
+            {"action": "created", "layer": 0, "via": "a/b/c.txt",
+             "fromType": None, "toType": "file"},
+            {"action": "whiteout", "layer": 1, "via": "a/.wh.b",
+             "fromType": "file", "toType": None},
+            {"action": "created", "layer": 2, "via": "a/b/c.txt",
+             "fromType": None, "toType": "file"},
+        ])
+        # The ancestor dir was implicitly re-materialized by the rebuild.
+        self.assertEqual(result["history"]["a/b"], [
+            {"action": "created", "layer": 0, "via": "a/b",
+             "fromType": None, "toType": "dir"},
+            {"action": "whiteout", "layer": 1, "via": "a/.wh.b",
+             "fromType": "dir", "toType": None},
+            {"action": "created", "layer": 2, "via": "a/b/c.txt",
+             "fromType": None, "toType": "dir"},
+        ])
+        self.assertEqual(paths_of(result)["a/b/c.txt"]["layer"], 2)
+
+    def test_implicit_parent_dirs_record_creation_events(self):
+        result = apply_layers([[F("a/b/c.txt")]])
+        self.assertEqual(result["history"]["a"], [
+            {"action": "created", "layer": 0, "via": "a/b/c.txt",
+             "fromType": None, "toType": "dir"},
+        ])
+        self.assertEqual(result["history"]["a/b"], [
+            {"action": "created", "layer": 0, "via": "a/b/c.txt",
+             "fromType": None, "toType": "dir"},
+        ])
+
+    def test_dir_restatement_adds_no_events(self):
+        result = apply_layers([[D("d"), F("d/a.txt")], [D("d"), F("d/b.txt")]])
+        self.assertEqual(result["history"]["d"], [
+            {"action": "created", "layer": 0, "via": "d",
+             "fromType": None, "toType": "dir"},
+        ])
+
+    def test_hardlink_creation_keeps_link_target(self):
+        result = apply_layers([[F("a.txt"), L("b.txt", "a.txt")]])
+        self.assertEqual(result["history"]["b.txt"], [
+            {"action": "created", "layer": 0, "via": "b.txt",
+             "fromType": None, "toType": "file", "link": "a.txt"},
+        ])
+
+    def test_whiteout_no_op_records_nothing(self):
+        result = apply_layers([[F("x.txt")], [F(".wh.never-existed")]])
+        self.assertNotIn("never-existed", result["history"])
+        self.assertNotIn(".wh.never-existed", result["history"])
+
+    def test_failed_layer_leaves_history_unreachable(self):
+        # apply_layers raises; the caller discards everything, history
+        # included, so a rejected audit has no partial record at all.
+        with self.assertRaises(EngineError):
+            apply_layers([[F("ok.txt")], [F("x"), F("x/y.txt")]])
+
+
 if __name__ == "__main__":
     unittest.main()

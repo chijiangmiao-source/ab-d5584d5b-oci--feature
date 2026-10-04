@@ -2,9 +2,12 @@
 
 Submits an audit that exercises opaque directories, whiteout deletion,
 file/dir replacement, path rebuild in a later layer and hard links, then
-reads the frozen result back and compares it exactly.  Also probes the
+reads the frozen result back and compares it exactly.  It also reads the
+full evolution record of a rebuilt path (create -> whiteout -> re-create)
+and of a descendant dropped by a directory replacement, and probes the
 negative paths (too many layers, dangling hard link, traversal, frozen id
-re-use, unknown id).  Exits 0 only if every check passes.
+re-use, unknown id, illegal/untracked history queries).  Exits 0 only if
+every check passes.
 
 Run: ``APP_ADDR=http://app:8080 python -m app.smoke``
 """
@@ -70,6 +73,26 @@ EXPECTED_DELETIONS = [
      "byLayer": 2, "via": "payload/scratch"},
 ]
 
+# Full evolution of a path that is created, whited-out and rebuilt.
+EXPECTED_GAIN_ACTIONS = [
+    {"action": "created", "layer": 0, "via": "payload/calib/gain.txt",
+     "fromType": None, "toType": "file"},
+    {"action": "whiteout", "layer": 1, "via": "payload/calib/.wh.gain.txt",
+     "fromType": "file", "toType": None},
+    {"action": "created", "layer": 2, "via": "payload/calib/gain.txt",
+     "fromType": None, "toType": "file"},
+]
+
+# A descendant dropped by its ancestor's dir->file replacement: the second
+# action is the ancestor action (via = "payload/scratch") that explains the
+# disappearance.
+EXPECTED_SCRATCH_TMP_ACTIONS = [
+    {"action": "created", "layer": 0, "via": "payload/scratch/tmp.txt",
+     "fromType": None, "toType": "file"},
+    {"action": "replaced", "layer": 2, "via": "payload/scratch",
+     "fromType": "file", "toType": None},
+]
+
 
 def _request(method: str, url: str, payload: dict | None = None,
              timeout: int = 10) -> tuple[int, dict]:
@@ -132,6 +155,50 @@ def main() -> int:
               got.get("deletions") == EXPECTED_DELETIONS,
               json.dumps(got.get("deletions")))
         check("GET frozen layerCount", got.get("layerCount") == 3)
+        check("GET frozen result carries no history key",
+              "history" not in got and "history" not in created)
+
+    print("[smoke] reading path evolution records", flush=True)
+    status, hist = _request(
+        "GET", f"{addr}/audits/{audit_id}/history?path=payload/calib/gain.txt")
+    check("GET history of rebuilt path -> 200", status == 200, f"got {status}")
+    if status == 200:
+        check("rebuilt path tracked and present from layer 2",
+              hist.get("tracked") is True and hist.get("present") is True
+              and hist.get("type") == "file" and hist.get("layer") == 2,
+              json.dumps(hist))
+        check("rebuilt path actions match",
+              hist.get("actions") == EXPECTED_GAIN_ACTIONS,
+              json.dumps(hist.get("actions")))
+
+    status, hist = _request(
+        "GET", f"{addr}/audits/{audit_id}/history?path=payload/scratch/tmp.txt")
+    check("GET history of replaced-dir descendant -> 200",
+          status == 200, f"got {status}")
+    if status == 200:
+        check("descendant tracked but absent",
+              hist.get("tracked") is True and hist.get("present") is False
+              and hist.get("type") is None and hist.get("layer") is None,
+              json.dumps(hist))
+        check("descendant actions explain disappearance",
+              hist.get("actions") == EXPECTED_SCRATCH_TMP_ACTIONS,
+              json.dumps(hist.get("actions")))
+
+    status, hist = _request(
+        "GET", f"{addr}/audits/{audit_id}/history?path=payload/never.txt")
+    check("untracked path -> 200 tracked:false",
+          status == 200 and hist.get("tracked") is False
+          and hist.get("actions") == [] and hist.get("present") is False,
+          f"got {status}: {json.dumps(hist)}")
+
+    status, _ = _request(
+        "GET", f"{addr}/audits/{audit_id}/history?path=../escape.txt")
+    check("illegal history path -> 400", status == 400, f"got {status}")
+    status, _ = _request("GET", f"{addr}/audits/{audit_id}/history")
+    check("missing history path param -> 400", status == 400, f"got {status}")
+    status, _ = _request(
+        "GET", f"{addr}/audits/never-submitted/history?path=payload")
+    check("history of unknown audit -> 404", status == 404, f"got {status}")
 
     status, _ = _request("POST", addr + "/audits",
                          {"id": audit_id, "layers": build_smoke_layers()})
@@ -147,6 +214,10 @@ def main() -> int:
     check("dangling hard link -> 400", status == 400, f"got {status}")
     status, _ = _request("GET", f"{addr}/audits/{audit_id}-dangling")
     check("failed audit left no state -> 404", status == 404, f"got {status}")
+    status, _ = _request(
+        "GET", f"{addr}/audits/{audit_id}-dangling/history?path=payload/link")
+    check("failed audit left no history -> 404", status == 404,
+          f"got {status}")
 
     traversal = layer_b64([f("../escape.txt", "x")])
     status, _ = _request("POST", addr + "/audits",

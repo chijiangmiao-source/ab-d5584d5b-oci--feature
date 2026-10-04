@@ -6,7 +6,9 @@
 调用方以审计标识向 `POST /audits` 提交 **1–6 层**（自底向上排列）的
 `base64(gzip(tar))` 数据；服务逐层严格校验后在内存中构建联合文件树，
 冻结最终裁决。`GET /audits/{id}` 返回冻结的最终路径清单、每条路径的
-来源层以及删除证据。任一层失败，整个审计被拒绝，不留下部分裁决。
+来源层以及删除证据；`GET /audits/{id}/history?path=...` 按规范路径
+返回完整演变记录（创建、覆盖、白化删除、opaque 清除、重新创建）。
+任一层失败，整个审计被拒绝，不留下部分裁决。
 
 ## 运行（Docker Compose）
 
@@ -20,7 +22,8 @@ echo "verify exit code: $?"
   （默认 `8080`）。Compose 健康检查打 `/healthz`。
 * `verify`：依赖 `app` 健康后启动，**先**运行白化规则单元测试与构建检查
   （`compileall` 字节编译），**再**提交一份含 opaque 目录与重建路径的审计
-  并读回结果做 HTTP 冒烟，最后以退出码结束（0 = 全部通过）。
+  并读回结果做 HTTP 冒烟（含一条路径的完整演变记录），最后以退出码结束
+  （0 = 全部通过）。
 
 无 Docker 时本地等价流程：
 
@@ -70,6 +73,40 @@ APP_ADDR=http://127.0.0.1:8080 python3 -m app.smoke
   目录被替换时其整棵子树逐条记录）；`byLayer` 为执行删除的层，`via`
   为触发该删除的条目路径。
 * 另有 `GET /audits`（列出已冻结 id）与 `GET /healthz`。
+
+### `GET /audits/{id}/history?path=<规范路径>`
+
+按层顺序返回单条路径的完整演变记录——创建、覆盖、白化删除、opaque
+清除与重新创建——用于追查某个最终路径为何存在或为何消失：
+
+```json
+{
+  "id": "run-2026-10-03-a",
+  "path": "payload/calib/gain.txt",
+  "tracked": true,
+  "present": true,
+  "type": "file",
+  "layer": 2,
+  "actions": [
+    {"action": "created",  "layer": 0, "via": "payload/calib/gain.txt",
+     "fromType": null,  "toType": "file"},
+    {"action": "whiteout", "layer": 1, "via": "payload/calib/.wh.gain.txt",
+     "fromType": "file", "toType": null},
+    {"action": "created",  "layer": 2, "via": "payload/calib/gain.txt",
+     "fromType": null,  "toType": "file"}
+  ]
+}
+```
+
+* `actions[]` 按层顺序排列；`action` ∈ `created`（创建/重新创建）、
+  `replaced`（覆盖）、`whiteout`（白化删除）、`opaque`（opaque 清除）。
+  `layer` 为执行动作的层，`via` 为触发条目路径，`fromType`/`toType`
+  为动作前后类型（`null` 表示不存在）；硬链接的创建动作附 `link`。
+* 目录被文件替换或被白化时，其后代路径的记录同样包含解释消失的祖先
+  动作（`via` 指向祖先层的触发条目）；后代在后续层重新创建时历史连续，
+  `present`/`type`/`layer` 取自冻结清单，与 `GET /audits/{id}` 一致。
+* 路径合法但从未出现：`200` + `{"tracked": false, "actions": []}`；
+  路径非法：`400`；审计未知或未冻结：`404`——均不泄露部分记录。
 
 ## 层校验规则（`app/tarparse.py`）
 
